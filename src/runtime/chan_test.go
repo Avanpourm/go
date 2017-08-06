@@ -210,11 +210,14 @@ func TestNonblockRecvRace(t *testing.T) {
 			select {
 			case <-c:
 			default:
-				t.Fatal("chan is not ready")
+				t.Error("chan is not ready")
 			}
 		}()
 		close(c)
 		<-c
+		if t.Failed() {
+			return
+		}
 	}
 }
 
@@ -311,14 +314,16 @@ func TestSelfSelect(t *testing.T) {
 						case c <- p:
 						case v := <-c:
 							if chanCap == 0 && v == p {
-								t.Fatalf("self receive")
+								t.Errorf("self receive")
+								return
 							}
 						}
 					} else {
 						select {
 						case v := <-c:
 							if chanCap == 0 && v == p {
-								t.Fatalf("self receive")
+								t.Errorf("self receive")
+								return
 							}
 						case c <- p:
 						}
@@ -593,8 +598,10 @@ func TestSelectStackAdjust(t *testing.T) {
 	// pointers are adjusted correctly by stack shrinking.
 	c := make(chan *int)
 	d := make(chan *int)
-	ready := make(chan bool)
-	go func() {
+	ready1 := make(chan bool)
+	ready2 := make(chan bool)
+
+	f := func(ready chan bool, dup bool) {
 		// Temporarily grow the stack to 10K.
 		stackGrowthRecursive((10 << 10) / (128 * 8))
 
@@ -604,10 +611,20 @@ func TestSelectStackAdjust(t *testing.T) {
 		val := 42
 		var cx *int
 		cx = &val
+
+		var c2 chan *int
+		var d2 chan *int
+		if dup {
+			c2 = c
+			d2 = d
+		}
+
 		// Receive from d. cx won't be affected.
 		select {
 		case cx = <-c:
+		case <-c2:
 		case <-d:
+		case <-d2:
 		}
 
 		// Check that pointer in cx was adjusted correctly.
@@ -622,10 +639,14 @@ func TestSelectStackAdjust(t *testing.T) {
 			}
 		}
 		ready <- true
-	}()
+	}
 
-	// Let the goroutine get into the select.
-	<-ready
+	go f(ready1, false)
+	go f(ready2, true)
+
+	// Let the goroutines get into the select.
+	<-ready1
+	<-ready2
 	time.Sleep(10 * time.Millisecond)
 
 	// Force concurrent GC a few times.
@@ -642,9 +663,10 @@ func TestSelectStackAdjust(t *testing.T) {
 done:
 	selectSink = nil
 
-	// Wake select.
-	d <- nil
-	<-ready
+	// Wake selects.
+	close(d)
+	<-ready1
+	<-ready2
 }
 
 func BenchmarkChanNonblocking(b *testing.B) {

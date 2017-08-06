@@ -6,6 +6,7 @@ package net
 
 import (
 	"fmt"
+	"internal/poll"
 	"internal/testenv"
 	"io"
 	"io/ioutil"
@@ -40,19 +41,6 @@ func TestDialTimeout(t *testing.T) {
 	origTestHookDialChannel := testHookDialChannel
 	defer func() { testHookDialChannel = origTestHookDialChannel }()
 	defer sw.Set(socktest.FilterConnect, nil)
-
-	// Avoid tracking open-close jitterbugs between netFD and
-	// socket that leads to confusion of information inside
-	// socktest.Switch.
-	// It may happen when the Dial call bumps against TCP
-	// simultaneous open. See selfConnect in tcpsock_posix.go.
-	defer func() {
-		sw.Set(socktest.FilterClose, nil)
-		forceCloseSockets()
-	}()
-	sw.Set(socktest.FilterClose, func(so *socktest.Status) (socktest.AfterFilter, error) {
-		return nil, errTimedout
-	})
 
 	for i, tt := range dialTimeoutTests {
 		switch runtime.GOOS {
@@ -124,7 +112,7 @@ func TestDialTimeoutMaxDuration(t *testing.T) {
 
 	for i, tt := range dialTimeoutMaxDurationTests {
 		ch := make(chan error)
-		max := time.NewTimer(100 * time.Millisecond)
+		max := time.NewTimer(250 * time.Millisecond)
 		defer max.Stop()
 		go func() {
 			d := Dialer{Timeout: tt.timeout}
@@ -158,12 +146,13 @@ var acceptTimeoutTests = []struct {
 }{
 	// Tests that accept deadlines in the past work, even if
 	// there's incoming connections available.
-	{-5 * time.Second, [2]error{errTimeout, errTimeout}},
+	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
 
-	{50 * time.Millisecond, [2]error{nil, errTimeout}},
+	{50 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
 }
 
 func TestAcceptTimeout(t *testing.T) {
+	testenv.SkipFlaky(t, 17948)
 	t.Parallel()
 
 	switch runtime.GOOS {
@@ -177,16 +166,18 @@ func TestAcceptTimeout(t *testing.T) {
 	}
 	defer ln.Close()
 
+	var wg sync.WaitGroup
 	for i, tt := range acceptTimeoutTests {
 		if tt.timeout < 0 {
+			wg.Add(1)
 			go func() {
-				c, err := Dial(ln.Addr().Network(), ln.Addr().String())
+				defer wg.Done()
+				d := Dialer{Timeout: 100 * time.Millisecond}
+				c, err := d.Dial(ln.Addr().Network(), ln.Addr().String())
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				var b [1]byte
-				c.Read(b[:])
 				c.Close()
 			}()
 		}
@@ -207,13 +198,14 @@ func TestAcceptTimeout(t *testing.T) {
 				}
 				if err == nil {
 					c.Close()
-					time.Sleep(tt.timeout / 3)
+					time.Sleep(10 * time.Millisecond)
 					continue
 				}
 				break
 			}
 		}
 	}
+	wg.Wait()
 }
 
 func TestAcceptTimeoutMustReturn(t *testing.T) {
@@ -308,17 +300,12 @@ var readTimeoutTests = []struct {
 }{
 	// Tests that read deadlines work, even if there's data ready
 	// to be read.
-	{-5 * time.Second, [2]error{errTimeout, errTimeout}},
+	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
 
-	{50 * time.Millisecond, [2]error{nil, errTimeout}},
+	{50 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
 }
 
 func TestReadTimeout(t *testing.T) {
-	switch runtime.GOOS {
-	case "plan9":
-		t.Skipf("not supported on %s", runtime.GOOS)
-	}
-
 	handler := func(ls *localServer, ln Listener) {
 		c, err := ln.Accept()
 		if err != nil {
@@ -437,14 +424,14 @@ var readFromTimeoutTests = []struct {
 }{
 	// Tests that read deadlines work, even if there's data ready
 	// to be read.
-	{-5 * time.Second, [2]error{errTimeout, errTimeout}},
+	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
 
-	{50 * time.Millisecond, [2]error{nil, errTimeout}},
+	{50 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
 }
 
 func TestReadFromTimeout(t *testing.T) {
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "nacl":
 		t.Skipf("not supported on %s", runtime.GOOS) // see golang.org/issue/8916
 	}
 
@@ -510,18 +497,13 @@ var writeTimeoutTests = []struct {
 }{
 	// Tests that write deadlines work, even if there's buffer
 	// space available to write.
-	{-5 * time.Second, [2]error{errTimeout, errTimeout}},
+	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
 
-	{10 * time.Millisecond, [2]error{nil, errTimeout}},
+	{10 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
 }
 
 func TestWriteTimeout(t *testing.T) {
 	t.Parallel()
-
-	switch runtime.GOOS {
-	case "plan9":
-		t.Skipf("not supported on %s", runtime.GOOS)
-	}
 
 	ln, err := newLocalListener("tcp")
 	if err != nil {
@@ -629,16 +611,16 @@ var writeToTimeoutTests = []struct {
 }{
 	// Tests that write deadlines work, even if there's buffer
 	// space available to write.
-	{-5 * time.Second, [2]error{errTimeout, errTimeout}},
+	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
 
-	{10 * time.Millisecond, [2]error{nil, errTimeout}},
+	{10 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
 }
 
 func TestWriteToTimeout(t *testing.T) {
 	t.Parallel()
 
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "nacl":
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
@@ -690,11 +672,6 @@ func TestWriteToTimeout(t *testing.T) {
 func TestReadTimeoutFluctuation(t *testing.T) {
 	t.Parallel()
 
-	switch runtime.GOOS {
-	case "plan9":
-		t.Skipf("not supported on %s", runtime.GOOS)
-	}
-
 	ln, err := newLocalListener("tcp")
 	if err != nil {
 		t.Fatal(err)
@@ -727,11 +704,6 @@ func TestReadTimeoutFluctuation(t *testing.T) {
 
 func TestReadFromTimeoutFluctuation(t *testing.T) {
 	t.Parallel()
-
-	switch runtime.GOOS {
-	case "plan9":
-		t.Skipf("not supported on %s", runtime.GOOS)
-	}
 
 	c1, err := newLocalPacketListener("udp")
 	if err != nil {
@@ -838,11 +810,6 @@ func (b neverEnding) Read(p []byte) (int, error) {
 }
 
 func testVariousDeadlines(t *testing.T) {
-	switch runtime.GOOS {
-	case "plan9":
-		t.Skipf("not supported on %s", runtime.GOOS)
-	}
-
 	type result struct {
 		n   int64
 		err error
@@ -1039,7 +1006,7 @@ func TestReadWriteDeadlineRace(t *testing.T) {
 	t.Parallel()
 
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "nacl":
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// SHA1 hash algorithm. See RFC 3174.
+// SHA-1 hash algorithm. See RFC 3174.
 
 package sha1
 
@@ -61,15 +61,24 @@ func TestGolden(t *testing.T) {
 			t.Fatalf("Sum function: sha1(%s) = %s want %s", g.in, s, g.out)
 		}
 		c := New()
-		for j := 0; j < 3; j++ {
-			if j < 2 {
+		for j := 0; j < 4; j++ {
+			var sum []byte
+			switch j {
+			case 0, 1:
 				io.WriteString(c, g.in)
-			} else {
+				sum = c.Sum(nil)
+			case 2:
 				io.WriteString(c, g.in[0:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
+				sum = c.Sum(nil)
+			case 3:
+				io.WriteString(c, g.in[0:len(g.in)/2])
+				c.(*digest).ConstantTimeSum(nil)
+				io.WriteString(c, g.in[len(g.in)/2:])
+				sum = c.(*digest).ConstantTimeSum(nil)
 			}
-			s := fmt.Sprintf("%x", c.Sum(nil))
+			s := fmt.Sprintf("%x", sum)
 			if s != g.out {
 				t.Fatalf("sha1[%d](%s) = %s want %s", j, g.in, s, g.out)
 			}
@@ -94,13 +103,15 @@ func TestBlockSize(t *testing.T) {
 
 // Tests that blockGeneric (pure Go) and block (in assembly for some architectures) match.
 func TestBlockGeneric(t *testing.T) {
-	gen, asm := New().(*digest), New().(*digest)
-	buf := make([]byte, BlockSize*20) // arbitrary factor
-	rand.Read(buf)
-	blockGeneric(gen, buf)
-	block(asm, buf)
-	if *gen != *asm {
-		t.Error("block and blockGeneric resulted in different states")
+	for i := 1; i < 30; i++ { // arbitrary factor
+		gen, asm := New().(*digest), New().(*digest)
+		buf := make([]byte, BlockSize*i)
+		rand.Read(buf)
+		blockGeneric(gen, buf)
+		block(asm, buf)
+		if *gen != *asm {
+			t.Errorf("For %#v block and blockGeneric resulted in different states", buf)
+		}
 	}
 }
 

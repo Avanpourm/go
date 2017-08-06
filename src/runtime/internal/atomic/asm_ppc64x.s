@@ -77,7 +77,7 @@ TEXT runtime∕internal∕atomic·Xadduintptr(SB), NOSPLIT, $0-24
 TEXT runtime∕internal∕atomic·Loadint64(SB), NOSPLIT, $0-16
 	BR	runtime∕internal∕atomic·Load64(SB)
 
-TEXT runtime∕internal∕atomic·Xaddint64(SB), NOSPLIT, $0-16
+TEXT runtime∕internal∕atomic·Xaddint64(SB), NOSPLIT, $0-24
 	BR	runtime∕internal∕atomic·Xadd64(SB)
 
 // bool casp(void **val, void *old, void *new)
@@ -161,7 +161,7 @@ TEXT runtime∕internal∕atomic·Store64(SB), NOSPLIT, $0-16
 	MOVD	R4, 0(R3)
 	RET
 
-// void	runtime∕internal∕atomic·Or8(byte volatile*, byte);
+// void runtime∕internal∕atomic·Or8(byte volatile*, byte);
 TEXT runtime∕internal∕atomic·Or8(SB), NOSPLIT, $0-9
 	MOVD	ptr+0(FP), R3
 	MOVBZ	val+8(FP), R4
@@ -174,15 +174,15 @@ again:
 	ISYNC
 	RET
 
-// void	runtime∕internal∕atomic·And8(byte volatile*, byte);
+// void runtime∕internal∕atomic·And8(byte volatile*, byte);
 TEXT runtime∕internal∕atomic·And8(SB), NOSPLIT, $0-9
 	MOVD	ptr+0(FP), R3
 	MOVBZ	val+8(FP), R4
 	SYNC
 again:
-	LBAR	(R3), R6
-	AND	R4, R6
-	STBCCC	R6, (R3)
+	LBAR	(R3),R6
+	AND	R4,R6
+	STBCCC	R6,(R3)
 	BNE	again
 	ISYNC
 	RET

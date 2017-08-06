@@ -140,7 +140,7 @@ type Dirent struct {
 }
 
 type Fsid struct {
-	_ [2]int32
+	X__val [2]int32
 }
 
 type Flock_t struct {
@@ -588,6 +588,7 @@ type Ustat_t struct {
 
 type EpollEvent struct {
 	Events uint32
+	_      int32
 	Fd     int32
 	Pad    int32
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -393,7 +394,7 @@ const defaultOutput = `  -A	for bootstrapping, allow 'any' type
   -Z int
     	an int that defaults to zero
   -maxT timeout
-    	set timeout for dial (default 0s)
+    	set timeout for dial
 `
 
 func TestPrintDefaults(t *testing.T) {
@@ -413,5 +414,21 @@ func TestPrintDefaults(t *testing.T) {
 	got := buf.String()
 	if got != defaultOutput {
 		t.Errorf("got %q want %q\n", got, defaultOutput)
+	}
+}
+
+// Issue 19230: validate range of Int and Uint flag values.
+func TestIntFlagOverflow(t *testing.T) {
+	if strconv.IntSize != 32 {
+		return
+	}
+	ResetForTesting(nil)
+	Int("i", 0, "")
+	Uint("u", 0, "")
+	if err := Set("i", "2147483648"); err == nil {
+		t.Error("unexpected success setting Int")
+	}
+	if err := Set("u", "4294967296"); err == nil {
+		t.Error("unexpected success setting Uint")
 	}
 }

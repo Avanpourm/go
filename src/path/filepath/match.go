@@ -240,17 +240,20 @@ func Glob(pattern string) (matches []string, err error) {
 	}
 
 	dir, file := Split(pattern)
-	switch dir {
-	case "":
-		dir = "."
-	case string(Separator):
-		// nothing
-	default:
-		dir = dir[0 : len(dir)-1] // chop off trailing separator
+	volumeLen := 0
+	if runtime.GOOS == "windows" {
+		volumeLen, dir = cleanGlobPathWindows(dir)
+	} else {
+		dir = cleanGlobPath(dir)
 	}
 
-	if !hasMeta(dir) {
+	if !hasMeta(dir[volumeLen:]) {
 		return glob(dir, file, nil)
+	}
+
+	// Prevent infinite recursion. See issue 15879.
+	if dir == pattern {
+		return nil, ErrBadPattern
 	}
 
 	var m []string
@@ -265,6 +268,38 @@ func Glob(pattern string) (matches []string, err error) {
 		}
 	}
 	return
+}
+
+// cleanGlobPath prepares path for glob matching.
+func cleanGlobPath(path string) string {
+	switch path {
+	case "":
+		return "."
+	case string(Separator):
+		// do nothing to the path
+		return path
+	default:
+		return path[0 : len(path)-1] // chop off trailing separator
+	}
+}
+
+// cleanGlobPathWindows is windows version of cleanGlobPath.
+func cleanGlobPathWindows(path string) (prefixLen int, cleaned string) {
+	vollen := volumeNameLen(path)
+	switch {
+	case path == "":
+		return 0, "."
+	case vollen+1 == len(path) && os.IsPathSeparator(path[len(path)-1]): // /, \, C:\ and C:/
+		// do nothing to the path
+		return vollen + 1, path
+	case vollen == len(path) && len(path) == 2: // C:
+		return vollen, path + "." // convert C: into C:.
+	default:
+		if vollen >= len(path) {
+			vollen = len(path) - 1
+		}
+		return vollen, path[0 : len(path)-1] // chop off trailing separator
+	}
 }
 
 // glob searches for files matching pattern in the directory dir

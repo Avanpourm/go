@@ -94,13 +94,21 @@ func cgoCheckSliceCopy(typ *_type, dst, src slice, n int) {
 //go:nosplit
 //go:nowritebarrier
 func cgoCheckTypedBlock(typ *_type, src unsafe.Pointer, off, size uintptr) {
+	// Anything past typ.ptrdata is not a pointer.
+	if typ.ptrdata <= off {
+		return
+	}
+	if ptrdataSize := typ.ptrdata - off; size > ptrdataSize {
+		size = ptrdataSize
+	}
+
 	if typ.kind&kindGCProg == 0 {
 		cgoCheckBits(src, typ.gcdata, off, size)
 		return
 	}
 
 	// The type has a GC program. Try to find GC bits somewhere else.
-	for datap := &firstmoduledata; datap != nil; datap = datap.next {
+	for _, datap := range activeModules() {
 		if cgoInRange(src, datap.data, datap.edata) {
 			doff := uintptr(src) - datap.data
 			cgoCheckBits(add(src, -doff), datap.gcdatamask.bytedata, off+doff, size)
@@ -115,8 +123,8 @@ func cgoCheckTypedBlock(typ *_type, src unsafe.Pointer, off, size uintptr) {
 
 	aoff := uintptr(src) - mheap_.arena_start
 	idx := aoff >> _PageShift
-	s := h_spans[idx]
-	if s.state == _MSpanStack {
+	s := mheap_.spans[idx]
+	if s.state == _MSpanManual {
 		// There are no heap bits for value stored on the stack.
 		// For a channel receive src might be on the stack of some
 		// other goroutine, so we can't unwind the stack even if
@@ -184,7 +192,7 @@ func cgoCheckBits(src unsafe.Pointer, gcbits *byte, off, size uintptr) {
 
 // cgoCheckUsingType is like cgoCheckTypedBlock, but is a last ditch
 // fall back to look for pointers in src using the type information.
-// We only this when looking at a value on the stack when the type
+// We only use this when looking at a value on the stack when the type
 // uses a GC program, because otherwise it's more efficient to use the
 // GC bits. This is called on the system stack.
 //go:nowritebarrier
@@ -193,6 +201,15 @@ func cgoCheckUsingType(typ *_type, src unsafe.Pointer, off, size uintptr) {
 	if typ.kind&kindNoPointers != 0 {
 		return
 	}
+
+	// Anything past typ.ptrdata is not a pointer.
+	if typ.ptrdata <= off {
+		return
+	}
+	if ptrdataSize := typ.ptrdata - off; size > ptrdataSize {
+		size = ptrdataSize
+	}
+
 	if typ.kind&kindGCProg == 0 {
 		cgoCheckBits(src, typ.gcdata, off, size)
 		return

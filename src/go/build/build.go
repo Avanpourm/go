@@ -238,7 +238,7 @@ func (ctxt *Context) gopath() []string {
 // that do not exist.
 func (ctxt *Context) SrcDirs() []string {
 	var all []string
-	if ctxt.GOROOT != "" {
+	if ctxt.GOROOT != "" && ctxt.Compiler != "gccgo" {
 		dir := ctxt.joinPath(ctxt.GOROOT, "src")
 		if ctxt.isDir(dir) {
 			all = append(all, dir)
@@ -292,7 +292,10 @@ func defaultContext() Context {
 	// say "+build go1.x", and code that should only be built before Go 1.x
 	// (perhaps it is the stub to use in that case) should say "+build !go1.x".
 	// NOTE: If you add to this list, also update the doc comment in doc.go.
-	c.ReleaseTags = []string{"go1.1", "go1.2", "go1.3", "go1.4", "go1.5", "go1.6", "go1.7", "go1.8", "go1.9"}
+	const version = 11 // go1.11
+	for i := 1; i <= version; i++ {
+		c.ReleaseTags = append(c.ReleaseTags, "go1."+strconv.Itoa(i))
+	}
 
 	env := os.Getenv("CGO_ENABLED")
 	if env == "" {
@@ -535,12 +538,13 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 		inTestdata := func(sub string) bool {
 			return strings.Contains(sub, "/testdata/") || strings.HasSuffix(sub, "/testdata") || strings.HasPrefix(sub, "testdata/") || sub == "testdata"
 		}
-		if ctxt.GOROOT != "" {
+		if ctxt.GOROOT != "" && ctxt.Compiler != "gccgo" {
 			root := ctxt.joinPath(ctxt.GOROOT, "src")
 			if sub, ok := ctxt.hasSubdir(root, p.Dir); ok && !inTestdata(sub) {
 				p.Goroot = true
 				p.ImportPath = sub
 				p.Root = ctxt.GOROOT
+				setPkga() // p.ImportPath changed
 				goto Found
 			}
 		}
@@ -551,7 +555,7 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 				// We found a potential import path for dir,
 				// but check that using it wouldn't find something
 				// else first.
-				if ctxt.GOROOT != "" {
+				if ctxt.GOROOT != "" && ctxt.Compiler != "gccgo" {
 					if dir := ctxt.joinPath(ctxt.GOROOT, "src", sub); ctxt.isDir(dir) {
 						p.ConflictDir = dir
 						goto Found
@@ -568,6 +572,7 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 				// Record it.
 				p.ImportPath = sub
 				p.Root = root
+				setPkga() // p.ImportPath changed
 				goto Found
 			}
 		}
@@ -615,7 +620,7 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 				}
 				return false
 			}
-			if searchVendor(ctxt.GOROOT, true) {
+			if ctxt.Compiler != "gccgo" && searchVendor(ctxt.GOROOT, true) {
 				goto Found
 			}
 			for _, root := range gopath {
@@ -628,15 +633,23 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 		// Determine directory from import path.
 		if ctxt.GOROOT != "" {
 			dir := ctxt.joinPath(ctxt.GOROOT, "src", path)
-			isDir := ctxt.isDir(dir)
-			binaryOnly = !isDir && mode&AllowBinary != 0 && pkga != "" && ctxt.isFile(ctxt.joinPath(ctxt.GOROOT, pkga))
-			if isDir || binaryOnly {
-				p.Dir = dir
-				p.Goroot = true
-				p.Root = ctxt.GOROOT
-				goto Found
+			if ctxt.Compiler != "gccgo" {
+				isDir := ctxt.isDir(dir)
+				binaryOnly = !isDir && mode&AllowBinary != 0 && pkga != "" && ctxt.isFile(ctxt.joinPath(ctxt.GOROOT, pkga))
+				if isDir || binaryOnly {
+					p.Dir = dir
+					p.Goroot = true
+					p.Root = ctxt.GOROOT
+					goto Found
+				}
 			}
 			tried.goroot = dir
+		}
+		if ctxt.Compiler == "gccgo" && isStandardPackage(path) {
+			p.Dir = ctxt.joinPath(ctxt.GOROOT, "src", path)
+			p.Goroot = true
+			p.Root = ctxt.GOROOT
+			goto Found
 		}
 		for _, root := range gopath {
 			dir := ctxt.joinPath(root, "src", path)
@@ -699,6 +712,11 @@ Found:
 	}
 	if binaryOnly && (mode&AllowBinary) != 0 {
 		return p, pkgerr
+	}
+
+	if ctxt.Compiler == "gccgo" && p.Goroot {
+		// gccgo has no sources for GOROOT packages.
+		return p, nil
 	}
 
 	dirs, err := ctxt.readDir(p.Dir)
@@ -808,7 +826,8 @@ Found:
 			})
 			p.InvalidGoFiles = append(p.InvalidGoFiles, name)
 		}
-		if pf.Doc != nil && p.Doc == "" {
+		// Grab the first package comment as docs, provided it is not from a test file.
+		if pf.Doc != nil && p.Doc == "" && !isTest && !isXTest {
 			p.Doc = doc.Synopsis(pf.Doc.Text())
 		}
 
@@ -1195,24 +1214,25 @@ func (ctxt *Context) shouldBuild(content []byte, allTags map[string]bool, binary
 			p = p[len(p):]
 		}
 		line = bytes.TrimSpace(line)
-		if bytes.HasPrefix(line, slashslash) {
-			if bytes.Equal(line, binaryOnlyComment) {
-				sawBinaryOnly = true
-			}
-			line = bytes.TrimSpace(line[len(slashslash):])
-			if len(line) > 0 && line[0] == '+' {
-				// Looks like a comment +line.
-				f := strings.Fields(string(line))
-				if f[0] == "+build" {
-					ok := false
-					for _, tok := range f[1:] {
-						if ctxt.match(tok, allTags) {
-							ok = true
-						}
+		if !bytes.HasPrefix(line, slashslash) {
+			continue
+		}
+		if bytes.Equal(line, binaryOnlyComment) {
+			sawBinaryOnly = true
+		}
+		line = bytes.TrimSpace(line[len(slashslash):])
+		if len(line) > 0 && line[0] == '+' {
+			// Looks like a comment +line.
+			f := strings.Fields(string(line))
+			if f[0] == "+build" {
+				ok := false
+				for _, tok := range f[1:] {
+					if ctxt.match(tok, allTags) {
+						ok = true
 					}
-					if !ok {
-						allok = false
-					}
+				}
+				if !ok {
+					allok = false
 				}
 			}
 		}
@@ -1545,32 +1565,10 @@ func (ctxt *Context) goodOSArchFile(name string, allTags map[string]bool) bool {
 	}
 	n := len(l)
 	if n >= 2 && knownOS[l[n-2]] && knownArch[l[n-1]] {
-		if allTags != nil {
-			allTags[l[n-2]] = true
-			allTags[l[n-1]] = true
-		}
-		if l[n-1] != ctxt.GOARCH {
-			return false
-		}
-		if ctxt.GOOS == "android" && l[n-2] == "linux" {
-			return true
-		}
-		return l[n-2] == ctxt.GOOS
+		return ctxt.match(l[n-1], allTags) && ctxt.match(l[n-2], allTags)
 	}
-	if n >= 1 && knownOS[l[n-1]] {
-		if allTags != nil {
-			allTags[l[n-1]] = true
-		}
-		if ctxt.GOOS == "android" && l[n-1] == "linux" {
-			return true
-		}
-		return l[n-1] == ctxt.GOOS
-	}
-	if n >= 1 && knownArch[l[n-1]] {
-		if allTags != nil {
-			allTags[l[n-1]] = true
-		}
-		return l[n-1] == ctxt.GOARCH
+	if n >= 1 && (knownOS[l[n-1]] || knownArch[l[n-1]]) {
+		return ctxt.match(l[n-1], allTags)
 	}
 	return true
 }
@@ -1588,7 +1586,7 @@ func init() {
 }
 
 // ToolDir is the directory containing build tools.
-var ToolDir = filepath.Join(runtime.GOROOT(), "pkg/tool/"+runtime.GOOS+"_"+runtime.GOARCH)
+var ToolDir = getToolDir()
 
 // IsLocalImport reports whether the import path is
 // a local import path, like ".", "..", "./foo", or "../foo".

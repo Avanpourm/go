@@ -63,17 +63,20 @@ func SetPendingDialHooks(before, after func()) {
 func SetTestHookServerServe(fn func(*Server, net.Listener)) { testHookServerServe = fn }
 
 func NewTestTimeoutHandler(handler Handler, ch <-chan time.Time) Handler {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-ch
+		cancel()
+	}()
 	return &timeoutHandler{
 		handler:     handler,
-		testTimeout: ch,
+		testContext: ctx,
 		// (no body)
 	}
 }
 
 func ResetCachedEnvironment() {
-	httpProxyEnv.reset()
-	httpsProxyEnv.reset()
-	noProxyEnv.reset()
+	resetProxyConfig()
 }
 
 func (t *Transport) NumPendingRequestsForTesting() int {
@@ -114,7 +117,7 @@ func (t *Transport) IdleConnStrsForTesting() []string {
 
 func (t *Transport) IdleConnStrsForTesting_h2() []string {
 	var ret []string
-	noDialPool := t.h2transport.ConnPool.(http2noDialClientConnPool)
+	noDialPool := t.h2transport.(*http2Transport).ConnPool.(http2noDialClientConnPool)
 	pool := noDialPool.http2clientConnPool
 
 	pool.mu.Lock()
@@ -130,9 +133,11 @@ func (t *Transport) IdleConnStrsForTesting_h2() []string {
 	return ret
 }
 
-func (t *Transport) IdleConnCountForTesting(cacheKey string) int {
+func (t *Transport) IdleConnCountForTesting(scheme, addr string) int {
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
+	key := connectMethodKey{"", scheme, addr}
+	cacheKey := key.String()
 	for k, conns := range t.idleConn {
 		if k.String() == cacheKey {
 			return len(conns)
@@ -157,13 +162,19 @@ func (t *Transport) RequestIdleConnChForTesting() {
 	t.getIdleConnCh(connectMethod{nil, "http", "example.com"})
 }
 
-func (t *Transport) PutIdleTestConn() bool {
+func (t *Transport) PutIdleTestConn(scheme, addr string) bool {
 	c, _ := net.Pipe()
+	key := connectMethodKey{"", scheme, addr}
+	select {
+	case <-t.incHostConnCount(key):
+	default:
+		return false
+	}
 	return t.tryPutIdleConn(&persistConn{
 		t:        t,
 		conn:     c,                   // dummy
 		closech:  make(chan struct{}), // so it can be closed
-		cacheKey: connectMethodKey{"", "http", "example.com"},
+		cacheKey: key,
 	}) == nil
 }
 
@@ -195,8 +206,8 @@ func (s *Server) ExportAllConnsIdle() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c := range s.activeConn {
-		st, ok := c.curState.Load().(ConnState)
-		if !ok || st != StateIdle {
+		st, unixSec := c.getState()
+		if unixSec == 0 || st != StateIdle {
 			return false
 		}
 	}
@@ -205,4 +216,10 @@ func (s *Server) ExportAllConnsIdle() bool {
 
 func (r *Request) WithT(t *testing.T) *Request {
 	return r.WithContext(context.WithValue(r.Context(), tLogKey{}, t.Logf))
+}
+
+func ExportSetH2GoawayTimeout(d time.Duration) (restore func()) {
+	old := http2goAwayTimeout
+	http2goAwayTimeout = d
+	return func() { http2goAwayTimeout = old }
 }

@@ -395,7 +395,7 @@ end:
 	PRECALC_32_79(Y13,Y14,Y15,Y5,Y12,0x60,0x240) \
 	PRECALC_32_79(Y12,Y13,Y14,Y3,Y8,0x60,0x260)
 
-// Macros calculating individual rounds have general forn
+// Macros calculating individual rounds have general form
 // CALC_ROUND_PRE + PRECALC_ROUND + CALC_ROUND_POST
 // CALC_ROUND_{PRE,POST} macros follow
 
@@ -413,7 +413,7 @@ end:
 	LEAL (REG_E)(R12*1), REG_E     // E += A >>> 5
 
 
-// Registers are cycleickly rotated DX -> AX -> DI -> SI -> BX -> CX
+// Registers are cyclically rotated DX -> AX -> DI -> SI -> BX -> CX
 #define CALC_0 \
 	MOVL SI, BX \ // Precalculating first round
 	RORXL $2, SI, SI \
@@ -1451,9 +1451,7 @@ TEXT ·blockAVX2(SB),$1408-32
 	CMPQ	R13, R11
 	CMOVQCC	R8, R13
 
-	MOVQ    $BSWAP_SHUFB_CTL<>(SB), R8
-	VMOVDQU (R8), Y10
-	MOVQ	$K_XMM_AR<>(SB), R8 //restore R8
+	VMOVDQU	BSWAP_SHUFB_CTL<>(SB), Y10
 
 	CALC // RET is inside macros
 

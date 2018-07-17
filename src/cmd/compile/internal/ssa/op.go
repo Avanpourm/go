@@ -35,6 +35,7 @@ type opInfo struct {
 	faultOnNilArg1    bool      // this op will fault if arg1 is nil (and aux encodes a small offset)
 	usesScratch       bool      // this op requires scratch memory space
 	hasSideEffects    bool      // for "reasons", not to be eliminated.  E.g., atomic store, #19182.
+	zeroWidth         bool      // op never translates into any machine code. example: copy, which may sometimes translate to machine code, is not zero-width.
 	symEffect         SymEffect // effect this op has on symbol in aux
 }
 
@@ -67,11 +68,12 @@ const (
 	auxFloat32              // auxInt is a float32 (encoded with math.Float64bits)
 	auxFloat64              // auxInt is a float64 (encoded with math.Float64bits)
 	auxString               // aux is a string
-	auxSym                  // aux is a symbol
+	auxSym                  // aux is a symbol (a *gc.Node for locals or an *obj.LSym for globals)
 	auxSymOff               // aux is a symbol, auxInt is an offset
 	auxSymValAndOff         // aux is a symbol, auxInt is a ValAndOff
 	auxTyp                  // aux is a type
 	auxTypSize              // aux is a type, auxInt is a size, must have Aux.(Type).Size() == AuxInt
+	auxCCop                 // aux is a ssa.Op that represents a flags-to-bool conversion (e.g. LessThan)
 
 	auxSymInt32 // aux is a symbol, auxInt is a 32-bit integer
 )

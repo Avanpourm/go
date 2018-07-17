@@ -18,18 +18,16 @@
 #define SYS_kill                 37
 #define SYS_brk			 45
 #define SYS_fcntl                55
-#define SYS_gettimeofday         78
 #define SYS_mmap                 90
 #define SYS_munmap               91
 #define SYS_setitimer           104
 #define SYS_clone               120
-#define SYS_select              142
 #define SYS_sched_yield         158
+#define SYS_nanosleep           162
 #define SYS_rt_sigreturn        173
 #define SYS_rt_sigaction        174
 #define SYS_rt_sigprocmask      175
 #define SYS_sigaltstack         186
-#define SYS_ugetrlimit          191
 #define SYS_madvise             219
 #define SYS_mincore             218
 #define SYS_gettid              236
@@ -49,11 +47,16 @@ TEXT runtime·exit(SB),NOSPLIT|NOFRAME,$0-4
 	SYSCALL
 	RET
 
-TEXT runtime·exit1(SB),NOSPLIT|NOFRAME,$0-4
-	MOVW	code+0(FP), R2
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT|NOFRAME,$0-8
+	MOVD	wait+0(FP), R1
+	// We're done using the stack.
+	MOVW	$0, R2
+	MOVW	R2, (R1)
+	MOVW	$0, R2	// exit code
 	MOVW	$SYS_exit, R1
 	SYSCALL
-	RET
+	JMP	0(PC)
 
 TEXT runtime·open(SB),NOSPLIT|NOFRAME,$0-20
 	MOVD	name+0(FP), R2
@@ -101,31 +104,21 @@ TEXT runtime·read(SB),NOSPLIT|NOFRAME,$0-28
 	MOVW	R2, ret+24(FP)
 	RET
 
-TEXT runtime·getrlimit(SB),NOSPLIT|NOFRAME,$0-20
-	MOVW	kind+0(FP), R2
-	MOVD	limit+8(FP), R3
-	MOVW	$SYS_ugetrlimit, R1
-	SYSCALL
-	MOVW	R2, ret+16(FP)
-	RET
-
 TEXT runtime·usleep(SB),NOSPLIT,$16-4
 	MOVW	usec+0(FP), R2
 	MOVD	R2, R4
 	MOVW	$1000000, R3
 	DIVD	R3, R2
 	MOVD	R2, 8(R15)
+	MOVW	$1000, R3
 	MULLD	R2, R3
 	SUB	R3, R4
 	MOVD	R4, 16(R15)
 
-	// select(0, 0, 0, 0, &tv)
-	MOVW	$0, R2
+	// nanosleep(&ts, 0)
+	ADD	$8, R15, R2
 	MOVW	$0, R3
-	MOVW	$0, R4
-	MOVW	$0, R5
-	ADD	$8, R15, R6
-	MOVW	$SYS_select, R1
+	MOVW	$SYS_nanosleep, R1
 	SYSCALL
 	RET
 
@@ -246,7 +239,7 @@ TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
 	BR	runtime·sigtramp(SB)
 
 // func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) unsafe.Pointer
-TEXT runtime·mmap(SB),NOSPLIT,$48-40
+TEXT runtime·mmap(SB),NOSPLIT,$48-48
 	MOVD	addr+0(FP), R2
 	MOVD	n+8(FP), R3
 	MOVW	prot+16(FP), R4
@@ -267,9 +260,14 @@ TEXT runtime·mmap(SB),NOSPLIT,$48-40
 	MOVW	$SYS_mmap, R1
 	SYSCALL
 	MOVD	$-4095, R3
-	CMPUBLT	R2, R3, 2(PC)
+	CMPUBLT	R2, R3, ok
 	NEG	R2
-	MOVD	R2, ret+32(FP)
+	MOVD	$0, p+32(FP)
+	MOVD	R2, err+40(FP)
+	RET
+ok:
+	MOVD	R2, p+32(FP)
+	MOVD	$0, err+40(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT|NOFRAME,$0

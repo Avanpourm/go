@@ -4,6 +4,10 @@
 
 package ssa
 
+import (
+	"math"
+)
+
 // checkFunc checks invariants of f.
 func checkFunc(f *Func) {
 	blockMark := make([]bool, f.NumBlocks())
@@ -98,7 +102,7 @@ func checkFunc(f *Func) {
 				f.Fatalf("plain/dead block %s has a control value", b)
 			}
 		}
-		if len(b.Succs) > 2 && b.Likely != BranchUnknown {
+		if len(b.Succs) != 2 && b.Likely != BranchUnknown {
 			f.Fatalf("likeliness prediction %d for block %s with %d successors", b.Likely, b, len(b.Succs))
 		}
 
@@ -156,6 +160,11 @@ func checkFunc(f *Func) {
 				}
 				canHaveAuxInt = true
 				canHaveAux = true
+			case auxCCop:
+				if _, ok := v.Aux.(Op); !ok {
+					f.Fatalf("bad type %T for CCop in %v", v.Aux, v)
+				}
+				canHaveAux = true
 			default:
 				f.Fatalf("unknown aux type for %s", v.Op)
 			}
@@ -194,13 +203,38 @@ func checkFunc(f *Func) {
 				if len(v.Args) == 0 {
 					f.Fatalf("no args for OpAddr %s", v.LongString())
 				}
-				if v.Args[0].Op != OpSP && v.Args[0].Op != OpSB {
+				if v.Args[0].Op != OpSB {
 					f.Fatalf("bad arg to OpAddr %v", v)
 				}
 			}
 
+			if v.Op == OpLocalAddr {
+				if len(v.Args) != 2 {
+					f.Fatalf("wrong # of args for OpLocalAddr %s", v.LongString())
+				}
+				if v.Args[0].Op != OpSP {
+					f.Fatalf("bad arg 0 to OpLocalAddr %v", v)
+				}
+				if !v.Args[1].Type.IsMemory() {
+					f.Fatalf("bad arg 1 to OpLocalAddr %v", v)
+				}
+			}
+
+			if f.RegAlloc != nil && f.Config.SoftFloat && v.Type.IsFloat() {
+				f.Fatalf("unexpected floating-point type %v", v.LongString())
+			}
+
+			// Check types.
+			// TODO: more type checks?
+			switch c := f.Config; v.Op {
+			case OpSP, OpSB:
+				if v.Type != c.Types.Uintptr {
+					f.Fatalf("bad %s type: want uintptr, have %s",
+						v.Op, v.Type.String())
+				}
+			}
+
 			// TODO: check for cycles in values
-			// TODO: check type
 		}
 	}
 
@@ -276,15 +310,17 @@ func checkFunc(f *Func) {
 	// Check loop construction
 	if f.RegAlloc == nil && f.pass != nil { // non-nil pass allows better-targeted debug printing
 		ln := f.loopnest()
-		po := f.postorder() // use po to avoid unreachable blocks.
-		for _, b := range po {
-			for _, s := range b.Succs {
-				bb := s.Block()
-				if ln.b2l[b.ID] == nil && ln.b2l[bb.ID] != nil && bb != ln.b2l[bb.ID].header {
-					f.Fatalf("block %s not in loop branches to non-header block %s in loop", b.String(), bb.String())
-				}
-				if ln.b2l[b.ID] != nil && ln.b2l[bb.ID] != nil && bb != ln.b2l[bb.ID].header && !ln.b2l[b.ID].isWithinOrEq(ln.b2l[bb.ID]) {
-					f.Fatalf("block %s in loop branches to non-header block %s in non-containing loop", b.String(), bb.String())
+		if !ln.hasIrreducible {
+			po := f.postorder() // use po to avoid unreachable blocks.
+			for _, b := range po {
+				for _, s := range b.Succs {
+					bb := s.Block()
+					if ln.b2l[b.ID] == nil && ln.b2l[bb.ID] != nil && bb != ln.b2l[bb.ID].header {
+						f.Fatalf("block %s not in loop branches to non-header block %s in loop", b.String(), bb.String())
+					}
+					if ln.b2l[b.ID] != nil && ln.b2l[bb.ID] != nil && bb != ln.b2l[bb.ID].header && !ln.b2l[b.ID].isWithinOrEq(ln.b2l[bb.ID]) {
+						f.Fatalf("block %s in loop branches to non-header block %s in non-containing loop", b.String(), bb.String())
+					}
 				}
 			}
 		}
@@ -450,11 +486,12 @@ func memCheck(f *Func) {
 		for _, b := range f.Blocks {
 			seenNonPhi := false
 			for _, v := range b.Values {
-				if v.Op == OpPhi {
+				switch v.Op {
+				case OpPhi:
 					if seenNonPhi {
 						f.Fatalf("phi after non-phi @ %s: %s", b, v)
 					}
-				} else {
+				default:
 					seenNonPhi = true
 				}
 			}
@@ -471,7 +508,8 @@ func domCheck(f *Func, sdom SparseTree, x, y *Block) bool {
 	return sdom.isAncestorEq(x, y)
 }
 
-// isExactFloat32 reoprts whether v has an AuxInt that can be exactly represented as a float32.
+// isExactFloat32 reports whether v has an AuxInt that can be exactly represented as a float32.
 func isExactFloat32(v *Value) bool {
-	return v.AuxFloat() == float64(float32(v.AuxFloat()))
+	x := v.AuxFloat()
+	return math.Float64bits(x) == math.Float64bits(float64(float32(x)))
 }

@@ -96,10 +96,10 @@ func Import(imp *types.Pkg, in *bufio.Reader) {
 
 	// read version specific flags - extend as necessary
 	switch p.version {
-	// case 6:
+	// case 7:
 	// 	...
 	//	fallthrough
-	case 5, 4, 3, 2, 1:
+	case 6, 5, 4, 3, 2, 1:
 		p.debugFormat = p.rawStringln(p.rawByte()) == "debug"
 		p.trackAllTypes = p.bool()
 		p.posInfoFormat = p.bool()
@@ -178,8 +178,8 @@ func Import(imp *types.Pkg, in *bufio.Reader) {
 		}
 		i0 = i
 
-		if funcdepth != 0 {
-			p.formatErrorf("unexpected Funcdepth %d", funcdepth)
+		if Curfn != nil {
+			p.formatErrorf("unexpected Curfn %v", Curfn)
 		}
 
 		// Note: In the original code, funchdr and funcbody are called for
@@ -187,20 +187,24 @@ func Import(imp *types.Pkg, in *bufio.Reader) {
 		// them only for functions with inlineable bodies. funchdr does
 		// parameter renaming which doesn't matter if we don't have a body.
 
-		if f := p.funcList[i]; f != nil {
+		inlCost := p.int()
+		if f := p.funcList[i]; f != nil && f.Func.Inl == nil {
 			// function not yet imported - read body and set it
 			funchdr(f)
 			body := p.stmtList()
-			if body == nil {
-				// Make sure empty body is not interpreted as
-				// no inlineable body (see also parser.fnbody)
-				// (not doing so can cause significant performance
-				// degradation due to unnecessary calls to empty
-				// functions).
-				body = []*Node{nod(OEMPTY, nil, nil)}
+			funcbody()
+			f.Func.Inl = &Inline{
+				Cost: int32(inlCost),
+				Body: body,
 			}
-			f.Func.Inl.Set(body)
-			funcbody(f)
+			importlist = append(importlist, f)
+			if Debug['E'] > 0 && Debug['m'] > 2 {
+				if Debug['m'] > 3 {
+					fmt.Printf("inl body for %v: %+v\n", f, asNodes(body))
+				} else {
+					fmt.Printf("inl body for %v: %v\n", f, asNodes(body))
+				}
+			}
 		} else {
 			// function already imported - read body but discard declarations
 			dclcontext = PDISCARD // throw away any declarations
@@ -278,6 +282,10 @@ func (p *importer) pkg() *types.Pkg {
 	} else {
 		path = p.string()
 	}
+	var height int
+	if p.version >= 6 {
+		height = p.int()
+	}
 
 	// we should never see an empty package name
 	if name == "" {
@@ -295,6 +303,18 @@ func (p *importer) pkg() *types.Pkg {
 		p.formatErrorf("package path %q for pkg index %d", path, len(p.pkgList))
 	}
 
+	if p.version >= 6 {
+		if height < 0 || height >= types.MaxPkgHeight {
+			p.formatErrorf("bad package height %v for package %s", height, name)
+		}
+
+		// reexported packages should always have a lower height than
+		// the main package
+		if len(p.pkgList) != 0 && height >= p.imp.Height {
+			p.formatErrorf("package %q (height %d) reexports package %q (height %d)", p.imp.Path, p.imp.Height, path, height)
+		}
+	}
+
 	// add package to pkgList
 	pkg := p.imp
 	if path != "" {
@@ -310,13 +330,15 @@ func (p *importer) pkg() *types.Pkg {
 		yyerror("import %q: package depends on %q (import cycle)", p.imp.Path, path)
 		errorexit()
 	}
+	pkg.Height = height
 	p.pkgList = append(p.pkgList, pkg)
 
 	return pkg
 }
 
 func idealType(typ *types.Type) *types.Type {
-	if typ.IsUntyped() {
+	switch typ {
+	case types.Idealint, types.Idealrune, types.Idealfloat, types.Idealcomplex:
 		// canonicalize ideal types
 		typ = types.Types[TIDEAL]
 	}
@@ -326,56 +348,36 @@ func idealType(typ *types.Type) *types.Type {
 func (p *importer) obj(tag int) {
 	switch tag {
 	case constTag:
-		p.pos()
+		pos := p.pos()
 		sym := p.qualifiedName()
 		typ := p.typ()
 		val := p.value(typ)
-		importconst(p.imp, sym, idealType(typ), nodlit(val))
+		importconst(p.imp, pos, sym, idealType(typ), val)
 
 	case aliasTag:
-		p.pos()
+		pos := p.pos()
 		sym := p.qualifiedName()
 		typ := p.typ()
-		importalias(p.imp, sym, typ)
+		importalias(p.imp, pos, sym, typ)
 
 	case typeTag:
 		p.typ()
 
 	case varTag:
-		p.pos()
+		pos := p.pos()
 		sym := p.qualifiedName()
 		typ := p.typ()
-		importvar(p.imp, sym, typ)
+		importvar(p.imp, pos, sym, typ)
 
 	case funcTag:
-		p.pos()
+		pos := p.pos()
 		sym := p.qualifiedName()
 		params := p.paramList()
 		result := p.paramList()
 
 		sig := functypefield(nil, params, result)
-		importsym(p.imp, sym, ONAME)
-		if asNode(sym.Def) != nil && asNode(sym.Def).Op == ONAME {
-			// function was imported before (via another import)
-			if !eqtype(sig, asNode(sym.Def).Type) {
-				p.formatErrorf("inconsistent definition for func %v during import\n\t%v\n\t%v", sym, asNode(sym.Def).Type, sig)
-			}
-			p.funcList = append(p.funcList, nil)
-			break
-		}
-
-		n := newfuncname(sym)
-		n.Type = sig
-		declare(n, PFUNC)
-		p.funcList = append(p.funcList, n)
-		importlist = append(importlist, n)
-
-		if Debug['E'] > 0 {
-			fmt.Printf("import [%q] func %v \n", p.imp.Path, n)
-			if Debug['m'] > 2 && n.Func.Inl.Len() != 0 {
-				fmt.Printf("inl body: %v\n", n.Func.Inl)
-			}
-		}
+		importfunc(p.imp, pos, sym, sig)
+		p.funcList = append(p.funcList, asNode(sym.Def))
 
 	default:
 		p.formatErrorf("unexpected object (tag = %d)", tag)
@@ -447,10 +449,7 @@ func (p *importer) newtyp(etype types.EType) *types.Type {
 // importtype declares that pt, an imported named type, has underlying type t.
 func (p *importer) importtype(pt, t *types.Type) {
 	if pt.Etype == TFORW {
-		copytype(asNode(pt.Nod), t)
-		pt.Sym.Importdef = p.imp
-		pt.Sym.Lastlineno = lineno
-		declare(asNode(pt.Nod), PEXTERN)
+		copytype(typenod(pt), t)
 		checkwidth(pt)
 	} else {
 		// pt.Orig and t must be identical.
@@ -479,11 +478,12 @@ func (p *importer) typ() *types.Type {
 	var t *types.Type
 	switch i {
 	case namedTag:
-		p.pos()
+		pos := p.pos()
 		tsym := p.qualifiedName()
 
-		t = pkgtype(p.imp, tsym)
+		t = importtype(p.imp, pos, tsym)
 		p.typList = append(p.typList, t)
+		dup := !t.IsKind(types.TFORW) // type already imported
 
 		// read underlying type
 		t0 := p.typ()
@@ -501,11 +501,11 @@ func (p *importer) typ() *types.Type {
 
 		// read associated methods
 		for i := p.int(); i > 0; i-- {
-			p.pos()
+			mpos := p.pos()
 			sym := p.fieldSym()
 
 			// during import unexported method names should be in the type's package
-			if !exportname(sym.Name) && sym.Pkg != tsym.Pkg {
+			if !types.IsExported(sym.Name) && sym.Pkg != tsym.Pkg {
 				Fatalf("imported method name %+v in wrong package %s\n", sym, tsym.Pkg.Name)
 			}
 
@@ -514,25 +514,32 @@ func (p *importer) typ() *types.Type {
 			result := p.paramList()
 			nointerface := p.bool()
 
-			n := newfuncname(methodname(sym, recv[0].Type))
-			n.Type = functypefield(recv[0], params, result)
+			mt := functypefield(recv[0], params, result)
+			oldm := addmethod(sym, mt, false, nointerface)
+
+			if dup {
+				// An earlier import already declared this type and its methods.
+				// Discard the duplicate method declaration.
+				n := asNode(oldm.Type.Nname())
+				p.funcList = append(p.funcList, n)
+				continue
+			}
+
+			n := newfuncnamel(mpos, methodSym(recv[0].Type, sym))
+			n.Type = mt
+			n.SetClass(PFUNC)
 			checkwidth(n.Type)
-			addmethod(sym, n.Type, false, nointerface)
 			p.funcList = append(p.funcList, n)
-			importlist = append(importlist, n)
 
 			// (comment from parser.go)
 			// inl.C's inlnode in on a dotmeth node expects to find the inlineable body as
 			// (dotmeth's type).Nname.Inl, and dotmeth's type has been pulled
 			// out by typecheck's lookdot as this $$.ttype. So by providing
 			// this back link here we avoid special casing there.
-			n.Type.FuncType().Nname = asTypesNode(n)
+			mt.SetNname(asTypesNode(n))
 
 			if Debug['E'] > 0 {
 				fmt.Printf("import [%q] meth %v \n", p.imp.Path, n)
-				if Debug['m'] > 2 && n.Func.Inl.Len() != 0 {
-					fmt.Printf("inl body: %v\n", n.Func.Inl)
-				}
 			}
 		}
 
@@ -580,7 +587,7 @@ func (p *importer) typ() *types.Type {
 		t = p.newtyp(TMAP)
 		mt := t.MapType()
 		mt.Key = p.typ()
-		mt.Val = p.typ()
+		mt.Elem = p.typ()
 
 	case chanTag:
 		t = p.newtyp(TCHAN)
@@ -616,7 +623,7 @@ func (p *importer) fieldList() (fields []*types.Field) {
 }
 
 func (p *importer) field() *types.Field {
-	p.pos()
+	pos := p.pos()
 	sym, alias := p.fieldName()
 	typ := p.typ()
 	note := p.string()
@@ -635,8 +642,8 @@ func (p *importer) field() *types.Field {
 		f.Embedded = 1
 	}
 
+	f.Pos = pos
 	f.Sym = sym
-	f.Nname = asTypesNode(newname(sym))
 	f.Type = typ
 	f.Note = note
 
@@ -646,8 +653,7 @@ func (p *importer) field() *types.Field {
 func (p *importer) methodList() (methods []*types.Field) {
 	for n := p.int(); n > 0; n-- {
 		f := types.NewField()
-		f.Nname = asTypesNode(newname(nblank.Sym))
-		asNode(f.Nname).Pos = p.pos()
+		f.Pos = p.pos()
 		f.Type = p.typ()
 		methods = append(methods, f)
 	}
@@ -660,14 +666,14 @@ func (p *importer) methodList() (methods []*types.Field) {
 }
 
 func (p *importer) method() *types.Field {
-	p.pos()
+	pos := p.pos()
 	sym := p.methodName()
 	params := p.paramList()
 	result := p.paramList()
 
 	f := types.NewField()
+	f.Pos = pos
 	f.Sym = sym
-	f.Nname = asTypesNode(newname(sym))
 	f.Type = functypefield(fakeRecvField(), params, result)
 	return f
 }
@@ -694,7 +700,7 @@ func (p *importer) fieldName() (*types.Sym, bool) {
 		alias = true
 		fallthrough
 	default:
-		if !exportname(name) {
+		if !types.IsExported(name) {
 			pkg = p.pkg()
 		}
 	}
@@ -709,7 +715,7 @@ func (p *importer) methodName() *types.Sym {
 		return builtinpkg.Lookup(name)
 	}
 	pkg := localpkg
-	if !exportname(name) {
+	if !types.IsExported(name) {
 		pkg = p.pkg()
 	}
 	return pkg.Lookup(name)
@@ -736,6 +742,8 @@ func (p *importer) paramList() []*types.Field {
 
 func (p *importer) param(named bool) *types.Field {
 	f := types.NewField()
+	// TODO(mdempsky): Need param position.
+	f.Pos = lineno
 	f.Type = p.typ()
 	if f.Type.Etype == TDDDFIELD {
 		// TDDDFIELD indicates wrapped ... slice type
@@ -755,7 +763,6 @@ func (p *importer) param(named bool) *types.Field {
 			pkg = p.pkg()
 		}
 		f.Sym = pkg.Lookup(name)
-		f.Nname = asTypesNode(newname(f.Sym))
 	}
 
 	// TODO(gri) This is compiler-specific (escape info).
@@ -782,8 +789,12 @@ func (p *importer) value(typ *types.Type) (x Val) {
 	case floatTag:
 		f := newMpflt()
 		p.float(f)
-		if typ == types.Idealint || typ.IsInteger() {
+		if typ == types.Idealint || typ.IsInteger() || typ.IsPtr() || typ.IsUnsafePtr() {
 			// uncommon case: large int encoded as float
+			//
+			// This happens for unsigned typed integers
+			// and (on 64-bit platforms) pointers because
+			// of values in the range [2^63, 2^64).
 			u := new(Mpint)
 			u.SetFloat(f)
 			x.U = u
@@ -916,18 +927,7 @@ func (p *importer) node() *Node {
 		pos := p.pos()
 		typ := p.typ()
 		n := npos(pos, nodlit(p.value(typ)))
-		if !typ.IsUntyped() {
-			// Type-checking simplifies unsafe.Pointer(uintptr(c))
-			// to unsafe.Pointer(c) which then cannot type-checked
-			// again. Re-introduce explicit uintptr(c) conversion.
-			// (issue 16317).
-			if typ.IsUnsafePtr() {
-				n = nod(OCONV, n, nil)
-				n.Type = types.Types[TUINTPTR]
-			}
-			n = nod(OCONV, n, nil)
-			n.Type = typ
-		}
+		n.Type = idealType(typ)
 		return n
 
 	case ONAME:
@@ -937,11 +937,7 @@ func (p *importer) node() *Node {
 	// 	unreachable - should have been resolved by typechecking
 
 	case OTYPE:
-		pos := p.pos()
-		if p.bool() {
-			return npos(pos, mkname(p.sym()))
-		}
-		return npos(pos, typenod(p.typ()))
+		return npos(p.pos(), typenod(p.typ()))
 
 	// case OTARRAY, OTMAP, OTCHAN, OTSTRUCT, OTINTER, OTFUNC:
 	//      unreachable - should have been resolved by typechecking
@@ -950,21 +946,26 @@ func (p *importer) node() *Node {
 	//	unimplemented
 
 	case OPTRLIT:
-		n := npos(p.pos(), p.expr())
+		pos := p.pos()
+		n := npos(pos, p.expr())
 		if !p.bool() /* !implicit, i.e. '&' operator */ {
 			if n.Op == OCOMPLIT {
 				// Special case for &T{...}: turn into (*T){...}.
-				n.Right = nod(OIND, n.Right, nil)
+				n.Right = nodl(pos, OIND, n.Right, nil)
 				n.Right.SetImplicit(true)
 			} else {
-				n = nod(OADDR, n, nil)
+				n = nodl(pos, OADDR, n, nil)
 			}
 		}
 		return n
 
 	case OSTRUCTLIT:
-		n := nodl(p.pos(), OCOMPLIT, nil, typenod(p.typ()))
+		// TODO(mdempsky): Export position information for OSTRUCTKEY nodes.
+		savedlineno := lineno
+		lineno = p.pos()
+		n := nodl(lineno, OCOMPLIT, nil, typenod(p.typ()))
 		n.List.Set(p.elemList()) // special handling of field names
+		lineno = savedlineno
 		return n
 
 	// case OARRAYLIT, OSLICELIT, OMAPLIT:
@@ -1082,7 +1083,7 @@ func (p *importer) node() *Node {
 			p.bool()
 		}
 		pos := p.pos()
-		lhs := dclname(p.sym())
+		lhs := npos(pos, dclname(p.sym()))
 		typ := typenod(p.typ())
 		return npos(pos, liststmt(variter([]*Node{lhs}, typ, nil))) // TODO(gri) avoid list creation
 
@@ -1097,7 +1098,7 @@ func (p *importer) node() *Node {
 
 	case OASOP:
 		n := nodl(p.pos(), OASOP, nil, nil)
-		n.Etype = types.EType(p.int())
+		n.SetSubOp(p.op())
 		n.Left = p.expr()
 		if !p.bool() {
 			n.Right = nodintconst(1)
@@ -1128,62 +1129,50 @@ func (p *importer) node() *Node {
 		return nodl(p.pos(), op, p.expr(), nil)
 
 	case OIF:
-		types.Markdcl()
 		n := nodl(p.pos(), OIF, nil, nil)
 		n.Ninit.Set(p.stmtList())
 		n.Left = p.expr()
 		n.Nbody.Set(p.stmtList())
 		n.Rlist.Set(p.stmtList())
-		types.Popdcl()
 		return n
 
 	case OFOR:
-		types.Markdcl()
 		n := nodl(p.pos(), OFOR, nil, nil)
 		n.Ninit.Set(p.stmtList())
 		n.Left, n.Right = p.exprsOrNil()
 		n.Nbody.Set(p.stmtList())
-		types.Popdcl()
 		return n
 
 	case ORANGE:
-		types.Markdcl()
 		n := nodl(p.pos(), ORANGE, nil, nil)
 		n.List.Set(p.stmtList())
 		n.Right = p.expr()
 		n.Nbody.Set(p.stmtList())
-		types.Popdcl()
 		return n
 
 	case OSELECT, OSWITCH:
-		types.Markdcl()
 		n := nodl(p.pos(), op, nil, nil)
 		n.Ninit.Set(p.stmtList())
 		n.Left, _ = p.exprsOrNil()
 		n.List.Set(p.stmtList())
-		types.Popdcl()
 		return n
 
 	// case OCASE, OXCASE:
 	// 	unreachable - mapped to OXCASE case below by exporter
 
 	case OXCASE:
-		types.Markdcl()
 		n := nodl(p.pos(), OXCASE, nil, nil)
-		n.Xoffset = int64(types.Block)
 		n.List.Set(p.exprList())
 		// TODO(gri) eventually we must declare variables for type switch
 		// statements (type switch statements are not yet exported)
 		n.Nbody.Set(p.stmtList())
-		types.Popdcl()
 		return n
 
 	// case OFALL:
 	// 	unreachable - mapped to OXFALL case below by exporter
 
-	case OXFALL:
-		n := nodl(p.pos(), OXFALL, nil, nil)
-		n.Xoffset = int64(types.Block)
+	case OFALL:
+		n := nodl(p.pos(), OFALL, nil, nil)
 		return n
 
 	case OBREAK, OCONTINUE:
@@ -1220,7 +1209,7 @@ func (p *importer) exprsOrNil() (a, b *Node) {
 		a = p.expr()
 	}
 	if ab&2 != 0 {
-		b = p.expr()
+		b = p.node()
 	}
 	return
 }
@@ -1228,7 +1217,7 @@ func (p *importer) exprsOrNil() (a, b *Node) {
 func (p *importer) fieldSym() *types.Sym {
 	name := p.string()
 	pkg := localpkg
-	if !exportname(name) {
+	if !types.IsExported(name) {
 		pkg = p.pkg()
 	}
 	return pkg.Lookup(name)

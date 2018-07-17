@@ -65,6 +65,17 @@ var builtinFuncs = [...]struct {
 	{"recover", ORECOVER},
 }
 
+// isBuiltinFuncName reports whether name matches a builtin function
+// name.
+func isBuiltinFuncName(name string) bool {
+	for _, fn := range builtinFuncs {
+		if fn.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 var unsafeFuncs = [...]struct {
 	name string
 	op   Op
@@ -103,16 +114,15 @@ func lexinit() {
 	}
 
 	for _, s := range builtinFuncs {
-		// TODO(marvin): Fix Node.EType type union.
 		s2 := builtinpkg.Lookup(s.name)
 		s2.Def = asTypesNode(newname(s2))
-		asNode(s2.Def).Etype = types.EType(s.op)
+		asNode(s2.Def).SetSubOp(s.op)
 	}
 
 	for _, s := range unsafeFuncs {
 		s2 := unsafepkg.Lookup(s.name)
 		s2.Def = asTypesNode(newname(s2))
-		asNode(s2.Def).Etype = types.EType(s.op)
+		asNode(s2.Def).SetSubOp(s.op)
 	}
 
 	types.Idealstring = types.New(TSTRING)
@@ -385,10 +395,7 @@ func lexinit1() {
 	s := builtinpkg.Lookup("error")
 	types.Errortype = makeErrorInterface()
 	types.Errortype.Sym = s
-	// TODO: If we can prove that it's safe to set errortype.Orig here
-	// than we don't need the special errortype/errorInterface case in
-	// bexport.go. See also issue #15920.
-	// errortype.Orig = makeErrorInterface()
+	types.Errortype.Orig = makeErrorInterface()
 	s.Def = asTypesNode(typenod(types.Errortype))
 
 	// We create separate byte and rune types for better error messages

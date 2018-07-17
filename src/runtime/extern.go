@@ -118,6 +118,12 @@ It is a comma-separated list of name=val pairs setting these named variables:
 	schedtrace: setting schedtrace=X causes the scheduler to emit a single line to standard
 	error every X milliseconds, summarizing the scheduler state.
 
+	tracebackancestors: setting tracebackancestors=N extends tracebacks with the stacks at
+	which goroutines were created, where N limits the number of ancestor goroutines to
+	report. This also extends the information returned by runtime.Stack. Ancestor's goroutine
+	IDs will refer to the ID of the goroutine at the time of creation; it's possible for this
+	ID to be reused for another goroutine. Setting N to 0 will report no ancestry information.
+
 The net and net/http packages also refer to debugging variables in GODEBUG.
 See the documentation for those packages for details.
 
@@ -178,11 +184,11 @@ func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 	// We asked for one extra, so skip that one. If this is sigpanic,
 	// stepping over this frame will set up state in Frames so the
 	// next frame is correct.
-	callers, _, ok = stackExpander.next(callers)
+	callers, _, ok = stackExpander.next(callers, true)
 	if !ok {
 		return
 	}
-	_, frame, _ := stackExpander.next(callers)
+	_, frame, _ := stackExpander.next(callers, true)
 	pc = frame.PC
 	file = frame.File
 	line = frame.Line
@@ -212,8 +218,8 @@ func Callers(skip int, pc []uintptr) int {
 	return callers(skip, pc)
 }
 
-// GOROOT returns the root of the Go tree.
-// It uses the GOROOT environment variable, if set,
+// GOROOT returns the root of the Go tree. It uses the
+// GOROOT environment variable, if set at process start,
 // or else the root used during the Go build.
 func GOROOT() string {
 	s := gogetenv("GOROOT")

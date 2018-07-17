@@ -27,6 +27,9 @@ import (
 	"cmd/go/internal/get"
 	"cmd/go/internal/help"
 	"cmd/go/internal/list"
+	"cmd/go/internal/modcmd"
+	"cmd/go/internal/modget"
+	"cmd/go/internal/modload"
 	"cmd/go/internal/run"
 	"cmd/go/internal/test"
 	"cmd/go/internal/tool"
@@ -37,29 +40,34 @@ import (
 
 func init() {
 	base.Commands = []*base.Command{
+		bug.CmdBug,
 		work.CmdBuild,
 		clean.CmdClean,
 		doc.CmdDoc,
 		envcmd.CmdEnv,
-		bug.CmdBug,
 		fix.CmdFix,
 		fmtcmd.CmdFmt,
 		generate.CmdGenerate,
 		get.CmdGet,
 		work.CmdInstall,
 		list.CmdList,
+		modcmd.CmdMod,
 		run.CmdRun,
 		test.CmdTest,
 		tool.CmdTool,
 		version.CmdVersion,
 		vet.CmdVet,
 
-		help.HelpC,
 		help.HelpBuildmode,
+		help.HelpC,
+		help.HelpCache,
+		help.HelpEnvironment,
 		help.HelpFileType,
 		help.HelpGopath,
-		help.HelpEnvironment,
+		get.HelpGopathGet,
 		help.HelpImportPath,
+		modload.HelpModules,
+		modget.HelpModuleGet,
 		help.HelpPackages,
 		test.HelpTestflag,
 		test.HelpTestfunc,
@@ -77,6 +85,12 @@ func main() {
 		base.Usage()
 	}
 
+	if modload.MustUseModules {
+		// If running with modules force-enabled, change get now to change help message.
+		*get.CmdGet = *modget.CmdGet
+	}
+
+	cfg.CmdName = args[0] // for error messages
 	if args[0] == "help" {
 		help.Help(args[1:])
 		return
@@ -89,6 +103,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: GOPATH set to GOROOT (%s) has no effect\n", gopath)
 	} else {
 		for _, p := range filepath.SplitList(gopath) {
+			// Some GOPATHs have empty directory elements - ignore them.
+			// See issue 21928 for details.
+			if p == "" {
+				continue
+			}
 			// Note: using HasPrefix instead of Contains because a ~ can appear
 			// in the middle of directory elements, such as /tmp/git-1.8.2~rc3
 			// or C:\PROGRA~1. Only ~ as a path prefix has meaning to the shell.
@@ -106,6 +125,30 @@ func main() {
 	if fi, err := os.Stat(cfg.GOROOT); err != nil || !fi.IsDir() {
 		fmt.Fprintf(os.Stderr, "go: cannot find GOROOT directory: %v\n", cfg.GOROOT)
 		os.Exit(2)
+	}
+
+	switch args[0] {
+	case "mod":
+		// Skip modload.Init (which may insist on go.mod existing)
+		// so that go mod -init has a chance to write the file.
+	case "version":
+		// Skip modload.Init so that users can report bugs against
+		// go mod -init.
+	case "vendor":
+		fmt.Fprintf(os.Stderr, "go vendor is now go mod -vendor\n")
+		os.Exit(2)
+	case "verify":
+		fmt.Fprintf(os.Stderr, "go verify is now go mod -verify\n")
+		os.Exit(2)
+	default:
+		// Run modload.Init so that each subcommand doesn't have to worry about it.
+		// Also install the module get command instead of the GOPATH go get command
+		// if modules are enabled.
+		modload.Init()
+		if modload.Enabled() {
+			// Might not have done this above, so do it now.
+			*get.CmdGet = *modget.CmdGet
+		}
 	}
 
 	// Set environment (GOOS, GOARCH, etc) explicitly.

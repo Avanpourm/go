@@ -34,13 +34,13 @@ const (
 	// span base.
 	maxObletBytes = 128 << 10
 
-	// idleCheckThreshold specifies how many units of work to do
-	// between run queue checks in an idle worker. Assuming a scan
+	// drainCheckThreshold specifies how many units of work to do
+	// between self-preemption checks in gcDrain. Assuming a scan
 	// rate of 1 MB/ms, this is ~100 µs. Lower values have higher
 	// overhead in the scan loop (the scheduler check may perform
 	// a syscall, so its overhead is nontrivial). Higher values
 	// make the system less responsive to incoming work.
-	idleCheckThreshold = 100000
+	drainCheckThreshold = 100000
 )
 
 // gcMarkRootPrepare queues root scanning jobs (stacks, globals, and
@@ -251,7 +251,7 @@ func markroot(gcw *gcWork, i uint32) {
 			selfScan := gp == userG && readgstatus(userG) == _Grunning
 			if selfScan {
 				casgstatus(userG, _Grunning, _Gwaiting)
-				userG.waitreason = "garbage collection scan"
+				userG.waitreason = waitReasonGarbageCollectionScan
 			}
 
 			// TODO: scang blocks until gp's stack has
@@ -530,7 +530,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 		// store that clears it but an atomic check in every malloc
 		// would be a performance hit.
 		// Instead we recheck it here on the non-preemptable system
-		// stack to determine if we should preform an assist.
+		// stack to determine if we should perform an assist.
 
 		// GC is done, so ignore any remaining debt.
 		gp.gcAssistBytes = 0
@@ -549,7 +549,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 
 	// gcDrainN requires the caller to be preemptible.
 	casgstatus(gp, _Grunning, _Gwaiting)
-	gp.waitreason = "GC assist marking"
+	gp.waitreason = waitReasonGCAssistMarking
 
 	// drain own cached work first in the hopes that it
 	// will be more cache friendly.
@@ -648,7 +648,7 @@ func gcParkAssist() bool {
 		return false
 	}
 	// Park.
-	goparkunlock(&work.assistQueue.lock, "GC assist wait", traceEvGoBlockGC, 2)
+	goparkunlock(&work.assistQueue.lock, waitReasonGCAssistWait, traceEvGoBlockGC, 2)
 	return true
 }
 
@@ -770,6 +770,13 @@ func scanstack(gp *g, gcw *gcWork) {
 		shrinkstack(gp)
 	}
 
+	// Scan the saved context register. This is effectively a live
+	// register that gets moved back and forth between the
+	// register and sched.ctxt without a write barrier.
+	if gp.sched.ctxt != nil {
+		scanblock(uintptr(unsafe.Pointer(&gp.sched.ctxt)), sys.PtrSize, &oneptrmask[0], gcw)
+	}
+
 	// Scan the stack.
 	var cache pcvalueCache
 	scanframe := func(frame *stkframe, unused unsafe.Pointer) bool {
@@ -784,73 +791,21 @@ func scanstack(gp *g, gcw *gcWork) {
 // Scan a stack frame: local variables and function arguments/results.
 //go:nowritebarrier
 func scanframeworker(frame *stkframe, cache *pcvalueCache, gcw *gcWork) {
+	if _DebugGC > 1 && frame.continpc != 0 {
+		print("scanframe ", funcname(frame.fn), "\n")
+	}
 
-	f := frame.fn
-	targetpc := frame.continpc
-	if targetpc == 0 {
-		// Frame is dead.
-		return
-	}
-	if _DebugGC > 1 {
-		print("scanframe ", funcname(f), "\n")
-	}
-	if targetpc != f.entry {
-		targetpc--
-	}
-	pcdata := pcdatavalue(f, _PCDATA_StackMapIndex, targetpc, cache)
-	if pcdata == -1 {
-		// We do not have a valid pcdata value but there might be a
-		// stackmap for this function. It is likely that we are looking
-		// at the function prologue, assume so and hope for the best.
-		pcdata = 0
-	}
+	locals, args := getStackMap(frame, cache, false)
 
 	// Scan local variables if stack frame has been allocated.
-	size := frame.varp - frame.sp
-	var minsize uintptr
-	switch sys.ArchFamily {
-	case sys.ARM64:
-		minsize = sys.SpAlign
-	default:
-		minsize = sys.MinFrameSize
-	}
-	if size > minsize {
-		stkmap := (*stackmap)(funcdata(f, _FUNCDATA_LocalsPointerMaps))
-		if stkmap == nil || stkmap.n <= 0 {
-			print("runtime: frame ", funcname(f), " untyped locals ", hex(frame.varp-size), "+", hex(size), "\n")
-			throw("missing stackmap")
-		}
-
-		// Locals bitmap information, scan just the pointers in locals.
-		if pcdata < 0 || pcdata >= stkmap.n {
-			// don't know where we are
-			print("runtime: pcdata is ", pcdata, " and ", stkmap.n, " locals stack map entries for ", funcname(f), " (targetpc=", targetpc, ")\n")
-			throw("scanframe: bad symbol table")
-		}
-		bv := stackmapdata(stkmap, pcdata)
-		size = uintptr(bv.n) * sys.PtrSize
-		scanblock(frame.varp-size, size, bv.bytedata, gcw)
+	if locals.n > 0 {
+		size := uintptr(locals.n) * sys.PtrSize
+		scanblock(frame.varp-size, size, locals.bytedata, gcw)
 	}
 
 	// Scan arguments.
-	if frame.arglen > 0 {
-		var bv bitvector
-		if frame.argmap != nil {
-			bv = *frame.argmap
-		} else {
-			stkmap := (*stackmap)(funcdata(f, _FUNCDATA_ArgsPointerMaps))
-			if stkmap == nil || stkmap.n <= 0 {
-				print("runtime: frame ", funcname(f), " untyped args ", hex(frame.argp), "+", hex(frame.arglen), "\n")
-				throw("missing stackmap")
-			}
-			if pcdata < 0 || pcdata >= stkmap.n {
-				// don't know where we are
-				print("runtime: pcdata is ", pcdata, " and ", stkmap.n, " args stack map entries for ", funcname(f), " (targetpc=", targetpc, ")\n")
-				throw("scanframe: bad symbol table")
-			}
-			bv = stackmapdata(stkmap, pcdata)
-		}
-		scanblock(frame.argp, uintptr(bv.n)*sys.PtrSize, bv.bytedata, gcw)
+	if args.n > 0 {
+		scanblock(frame.argp, uintptr(args.n)*sys.PtrSize, args.bytedata, gcw)
 	}
 }
 
@@ -861,6 +816,7 @@ const (
 	gcDrainNoBlock
 	gcDrainFlushBgCredit
 	gcDrainIdle
+	gcDrainFractional
 
 	// gcDrainBlock means neither gcDrainUntilPreempt or
 	// gcDrainNoBlock. It is the default, but callers should use
@@ -876,6 +832,10 @@ const (
 //
 // If flags&gcDrainIdle != 0, gcDrain returns when there is other work
 // to do. This implies gcDrainNoBlock.
+//
+// If flags&gcDrainFractional != 0, gcDrain self-preempts when
+// pollFractionalWorkerExit() returns true. This implies
+// gcDrainNoBlock.
 //
 // If flags&gcDrainNoBlock != 0, gcDrain returns as soon as it is
 // unable to get more work. Otherwise, it will block until all
@@ -893,14 +853,24 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 
 	gp := getg().m.curg
 	preemptible := flags&gcDrainUntilPreempt != 0
-	blocking := flags&(gcDrainUntilPreempt|gcDrainIdle|gcDrainNoBlock) == 0
+	blocking := flags&(gcDrainUntilPreempt|gcDrainIdle|gcDrainFractional|gcDrainNoBlock) == 0
 	flushBgCredit := flags&gcDrainFlushBgCredit != 0
 	idle := flags&gcDrainIdle != 0
 
 	initScanWork := gcw.scanWork
-	// idleCheck is the scan work at which to perform the next
-	// idle check with the scheduler.
-	idleCheck := initScanWork + idleCheckThreshold
+
+	// checkWork is the scan work before performing the next
+	// self-preempt check.
+	checkWork := int64(1<<63 - 1)
+	var check func() bool
+	if flags&(gcDrainIdle|gcDrainFractional) != 0 {
+		checkWork = initScanWork + drainCheckThreshold
+		if idle {
+			check = pollWork
+		} else if flags&gcDrainFractional != 0 {
+			check = pollFractionalWorkerExit
+		}
+	}
 
 	// Drain root marking jobs.
 	if work.markrootNext < work.markrootJobs {
@@ -910,7 +880,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 				break
 			}
 			markroot(gcw, job)
-			if idle && pollWork() {
+			if check != nil && check() {
 				goto done
 			}
 		}
@@ -951,12 +921,12 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 				gcFlushBgCredit(gcw.scanWork - initScanWork)
 				initScanWork = 0
 			}
-			idleCheck -= gcw.scanWork
+			checkWork -= gcw.scanWork
 			gcw.scanWork = 0
 
-			if idle && idleCheck <= 0 {
-				idleCheck += idleCheckThreshold
-				if pollWork() {
+			if checkWork <= 0 {
+				checkWork += drainCheckThreshold
+				if check != nil && check() {
 					break
 				}
 			}
@@ -1063,9 +1033,6 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork) {
 	b := b0
 	n := n0
 
-	arena_start := mheap_.arena_start
-	arena_used := mheap_.arena_used
-
 	for i := uintptr(0); i < n; {
 		// Find bits for the next word.
 		bits := uint32(*addb(ptrmask, i/(sys.PtrSize*8)))
@@ -1077,9 +1044,9 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork) {
 			if bits&1 != 0 {
 				// Same work as in scanobject; see comments there.
 				obj := *(*uintptr)(unsafe.Pointer(b + i))
-				if obj != 0 && arena_start <= obj && obj < arena_used {
-					if obj, hbits, span, objIndex := heapBitsForObject(obj, b, i); obj != 0 {
-						greyobject(obj, b, i, hbits, span, gcw, objIndex)
+				if obj != 0 {
+					if obj, span, objIndex := findObject(obj, b, i); obj != 0 {
+						greyobject(obj, b, i, span, gcw, objIndex)
 					}
 				}
 			}
@@ -1096,18 +1063,6 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork) {
 //
 //go:nowritebarrier
 func scanobject(b uintptr, gcw *gcWork) {
-	// Note that arena_used may change concurrently during
-	// scanobject and hence scanobject may encounter a pointer to
-	// a newly allocated heap object that is *not* in
-	// [start,used). It will not mark this object; however, we
-	// know that it was just installed by a mutator, which means
-	// that mutator will execute a write barrier and take care of
-	// marking it. This is even more pronounced on relaxed memory
-	// architectures since we access arena_used without barriers
-	// or synchronization, but the same logic applies.
-	arena_start := mheap_.arena_start
-	arena_used := mheap_.arena_used
-
 	// Find the bits for b and the size of the object at b.
 	//
 	// b is either the beginning of an object, in which case this
@@ -1181,11 +1136,19 @@ func scanobject(b uintptr, gcw *gcWork) {
 		obj := *(*uintptr)(unsafe.Pointer(b + i))
 
 		// At this point we have extracted the next potential pointer.
-		// Check if it points into heap and not back at the current object.
-		if obj != 0 && arena_start <= obj && obj < arena_used && obj-b >= n {
-			// Mark the object.
-			if obj, hbits, span, objIndex := heapBitsForObject(obj, b, i); obj != 0 {
-				greyobject(obj, b, i, hbits, span, gcw, objIndex)
+		// Quickly filter out nil and pointers back to the current object.
+		if obj != 0 && obj-b >= n {
+			// Test if obj points into the Go heap and, if so,
+			// mark the object.
+			//
+			// Note that it's possible for findObject to
+			// fail if obj points to a just-allocated heap
+			// object because of a race with growing the
+			// heap. In this case, we know the object was
+			// just allocated and hence will be marked by
+			// allocation itself.
+			if obj, span, objIndex := findObject(obj, b, i); obj != 0 {
+				greyobject(obj, b, i, span, gcw, objIndex)
 			}
 		}
 	}
@@ -1198,9 +1161,9 @@ func scanobject(b uintptr, gcw *gcWork) {
 // Preemption must be disabled.
 //go:nowritebarrier
 func shade(b uintptr) {
-	if obj, hbits, span, objIndex := heapBitsForObject(b, 0, 0); obj != 0 {
+	if obj, span, objIndex := findObject(b, 0, 0); obj != 0 {
 		gcw := &getg().m.p.ptr().gcw
-		greyobject(obj, 0, 0, hbits, span, gcw, objIndex)
+		greyobject(obj, 0, 0, span, gcw, objIndex)
 		if gcphase == _GCmarktermination || gcBlackenPromptly {
 			// Ps aren't allowed to cache work during mark
 			// termination.
@@ -1212,8 +1175,11 @@ func shade(b uintptr) {
 // obj is the start of an object with mark mbits.
 // If it isn't already marked, mark it and enqueue into gcw.
 // base and off are for debugging only and could be removed.
+//
+// See also wbBufFlush1, which partially duplicates this logic.
+//
 //go:nowritebarrierrec
-func greyobject(obj, base, off uintptr, hbits heapBits, span *mspan, gcw *gcWork, objIndex uintptr) {
+func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintptr) {
 	// obj should be start of allocation, and so must be at least pointer-aligned.
 	if obj&(sys.PtrSize-1) != 0 {
 		throw("greyobject: obj not pointer-aligned")
@@ -1235,6 +1201,7 @@ func greyobject(obj, base, off uintptr, hbits heapBits, span *mspan, gcw *gcWork
 			getg().m.traceback = 2
 			throw("checkmark found unmarked object")
 		}
+		hbits := heapBitsForAddr(obj)
 		if hbits.isCheckmarked(span.elemsize) {
 			return
 		}
@@ -1279,15 +1246,8 @@ func greyobject(obj, base, off uintptr, hbits heapBits, span *mspan, gcw *gcWork
 // gcDumpObject dumps the contents of obj for debugging and marks the
 // field at byte offset off in obj.
 func gcDumpObject(label string, obj, off uintptr) {
-	if obj < mheap_.arena_start || obj >= mheap_.arena_used {
-		print(label, "=", hex(obj), " is not in the Go heap\n")
-		return
-	}
-	k := obj >> _PageShift
-	x := k
-	x -= mheap_.arena_start >> _PageShift
-	s := mheap_.spans[x]
-	print(label, "=", hex(obj), " k=", hex(k))
+	s := spanOf(obj)
+	print(label, "=", hex(obj))
 	if s == nil {
 		print(" s=nil\n")
 		return
@@ -1356,17 +1316,14 @@ func gcmarknewobject(obj, size, scanSize uintptr) {
 //
 // The world must be stopped.
 func gcMarkTinyAllocs() {
-	for _, p := range &allp {
-		if p == nil || p.status == _Pdead {
-			break
-		}
+	for _, p := range allp {
 		c := p.mcache
 		if c == nil || c.tiny == 0 {
 			continue
 		}
-		_, hbits, span, objIndex := heapBitsForObject(c.tiny, 0, 0)
+		_, span, objIndex := findObject(c.tiny, 0, 0)
 		gcw := &p.gcw
-		greyobject(c.tiny, 0, 0, hbits, span, gcw, objIndex)
+		greyobject(c.tiny, 0, 0, span, gcw, objIndex)
 		if gcBlackenPromptly {
 			gcw.dispose()
 		}
@@ -1401,7 +1358,7 @@ func initCheckmarks() {
 	useCheckmark = true
 	for _, s := range mheap_.allspans {
 		if s.state == _MSpanInUse {
-			heapBitsForSpan(s.base()).initCheckmarkSpan(s.layout())
+			heapBitsForAddr(s.base()).initCheckmarkSpan(s.layout())
 		}
 	}
 }
@@ -1410,7 +1367,7 @@ func clearCheckmarks() {
 	useCheckmark = false
 	for _, s := range mheap_.allspans {
 		if s.state == _MSpanInUse {
-			heapBitsForSpan(s.base()).clearCheckmarkSpan(s.layout())
+			heapBitsForAddr(s.base()).clearCheckmarkSpan(s.layout())
 		}
 	}
 }
